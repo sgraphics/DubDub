@@ -103,70 +103,14 @@ class AudioMixer:
         return duration
 
     def save_final_audio(self) -> Path:
-        """Try single-pass processing first, fall back to chunked if needed"""
+        """Process audio in batches using compressed formats"""
         print("Mixing final audio...")
         start_time = time.time()
         
         # Output path for final audio
         output_path = self.temp_dir / "final_audio.ac3"
         
-        # Try single-pass processing first
-        try:
-            # Build FFmpeg command for single-pass processing
-            cmd = ['ffmpeg', '-y']
-            
-            # Add all input files
-            cmd.extend(['-i', str(self.orig_audio)])  # Original audio
-            for mix in self.mix_inputs:
-                cmd.extend(['-i', str(mix['file'])])
-            
-            # Create filter graph
-            filter_parts = []
-            
-            # Start with original audio
-            filter_parts.append("[0:a]volume=1[orig];")
-            
-            # Add volume adjustment and delays for each TTS segment
-            for i, mix in enumerate(self.mix_inputs, 1):
-                delay_ms = int(mix['start'] * 1000)
-                volume = "-5dB" if mix['lyrics_mode'] else "-8dB"
-                filter_parts.append(
-                    f"[{i}:a]adelay={delay_ms}|{delay_ms},volume={volume}[v{i}];"
-                )
-            
-            # Create mix of all streams
-            streams = ['[orig]'] + [f'[v{i}]' for i in range(1, len(self.mix_inputs) + 1)]
-            filter_parts.append(f"{','.join(streams)}amix=inputs={len(streams)}:normalize=0[out]")
-            
-            # Add filter complex and output options
-            cmd.extend([
-                '-filter_complex', ''.join(filter_parts),
-                '-map', '[out]',
-                '-c:a', 'ac3',
-                '-b:a', '192k',
-                '-strict', '-2',
-                str(output_path)
-            ])
-            
-            # Try single-pass processing
-            print("Attempting single-pass audio processing...")
-            subprocess.run(cmd, check=True)
-            print(f"Single-pass audio processing successful! Took {time.time() - start_time:.2f} seconds")
-            return output_path
-            
-        except subprocess.CalledProcessError as e:
-            print(f"Single-pass processing failed: {e}")
-            print("Falling back to chunked processing...")
-            return self._save_final_audio_chunked()
-    
-    def _save_final_audio_chunked(self) -> Path:
-        """Process audio in chunks when single-pass fails"""
-        print(f"Using chunked audio processing for {len(self.mix_inputs)} subtitle segments")
-        
-        # Output path
-        output_path = self.temp_dir / "final_audio.ac3"
-        
-        # Create silent base audio (using AAC instead of WAV)
+        # Create silent base audio (using AAC)
         silent_base = self.temp_dir / "silence.m4a"
         if not silent_base.exists():
             max_duration = max([mix['start'] + mix['duration'] for mix in self.mix_inputs]) + 5
@@ -180,10 +124,13 @@ class AudioMixer:
                 str(silent_base)
             ], check=True)
         
-        # Process in batches
-        batch_size = 30
+        # Process in batches of 50 (using compressed formats allows for larger batches)
+        batch_size = 50
         temp_audio_segments = []
         sorted_inputs = sorted(self.mix_inputs, key=lambda x: x['start'])
+        
+        total_batches = (len(sorted_inputs) + batch_size - 1) // batch_size
+        print(f"Processing {len(sorted_inputs)} segments in {total_batches} batches of up to {batch_size} segments each")
         
         for batch_idx in range(0, len(sorted_inputs), batch_size):
             batch = sorted_inputs[batch_idx:batch_idx + batch_size]
@@ -202,7 +149,7 @@ class AudioMixer:
             filter_parts = []
             for i, mix in enumerate(batch):
                 batch_cmd.extend(['-i', str(mix['file'])])
-                vol = "-5dB" if mix['lyrics_mode'] else "-8dB"
+                vol = "-6dB" if mix['lyrics_mode'] else "-10dB"
                 filter_parts.append(f"[{i+1}:a]adelay={int(mix['start']*1000)}|{int(mix['start']*1000)},volume={vol}[s{i}];")
             
             # Add mix for all streams
@@ -235,26 +182,26 @@ class AudioMixer:
             ], check=True)
             return output_path
         
-        # Final mix of all segments with original audio
-        final_cmd = [
-            'ffmpeg', '-y',
-            '-i', str(self.orig_audio)
-        ]
+        # Mix all batches with original audio
+        print("Mixing batches with original audio...")
+        mix_cmd = ['ffmpeg', '-y']
         
+        # Add all inputs
+        mix_cmd.extend(['-i', str(self.orig_audio)])  # Original audio first
         for segment in temp_audio_segments:
-            final_cmd.extend(['-i', str(segment)])
-        
-        final_cmd.extend([
+            mix_cmd.extend(['-i', str(segment)])
+            
+        # Create mix filter
+        mix_cmd.extend([
             '-filter_complex', f'amix=inputs={len(temp_audio_segments)+1}:normalize=0[out]',
             '-map', '[out]',
             '-c:a', 'ac3',
             '-b:a', '192k',
-            '-strict', '-2',
             str(output_path)
         ])
         
         try:
-            subprocess.run(final_cmd, check=True)
+            subprocess.run(mix_cmd, check=True)
         except subprocess.CalledProcessError:
             print("Final mixing failed, using original audio as fallback")
             subprocess.run([
@@ -265,6 +212,7 @@ class AudioMixer:
                 str(output_path)
             ], check=True)
         
+        print(f"Audio processing completed in {time.time() - start_time:.2f} seconds")
         return output_path
 
     def cleanup(self):
