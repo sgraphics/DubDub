@@ -92,12 +92,11 @@ class AudioMixer:
                 str(short_path)
             ], capture_output=True, check=True)
         
-        # Store the mixing information for later
+        # Store the mixing information for later - no longer care about lyrics_mode
         self.mix_inputs.append({
             'file': short_path,
             'start': start_time,
-            'duration': duration,
-            'lyrics_mode': lyrics_mode
+            'duration': duration
         })
         
         return duration
@@ -107,13 +106,21 @@ class AudioMixer:
         print("Mixing final audio...")
         start_time = time.time()
         
+        # Sort all segments by start time
+        sorted_inputs = sorted(self.mix_inputs, key=lambda x: x['start'])
+        
         # Output path for final audio
         output_path = self.temp_dir / "final_audio.ac3"
+        
+        # Create a temporary file for the processed voiceovers
+        voiceover_track = self.temp_dir / "voiceovers.m4a"
+        
+        # Get maximum duration
+        max_duration = max([mix['start'] + mix['duration'] for mix in self.mix_inputs]) + 5
         
         # Create silent base audio (using AAC)
         silent_base = self.temp_dir / "silence.m4a"
         if not silent_base.exists():
-            max_duration = max([mix['start'] + mix['duration'] for mix in self.mix_inputs]) + 5
             subprocess.run([
                 'ffmpeg', '-y',
                 '-f', 'lavfi',
@@ -124,36 +131,31 @@ class AudioMixer:
                 str(silent_base)
             ], check=True)
         
-        # Process in batches of 50 (using compressed formats allows for larger batches)
+        # First, create a track with just the voiceovers
+        print("Creating voiceover track...")
+        
+        # Process in batches to avoid command line length limitations
         batch_size = 50
-        temp_audio_segments = []
-        sorted_inputs = sorted(self.mix_inputs, key=lambda x: x['start'])
+        temp_segments = []
         
         total_batches = (len(sorted_inputs) + batch_size - 1) // batch_size
-        print(f"Processing {len(sorted_inputs)} segments in {total_batches} batches of up to {batch_size} segments each")
+        print(f"Processing {len(sorted_inputs)} segments in {total_batches} batches")
         
         for batch_idx in range(0, len(sorted_inputs), batch_size):
             batch = sorted_inputs[batch_idx:batch_idx + batch_size]
-            print(f"Processing batch {batch_idx//batch_size + 1}/{(len(sorted_inputs) + batch_size - 1)//batch_size}...")
+            batch_output = self.temp_dir / f"voiceover_batch_{batch_idx}.m4a"
             
-            # Create a batch output file (using AAC)
-            batch_output = self.temp_dir / f"batch_{batch_idx}.m4a"
+            # Add all voiceovers to silent base
+            batch_cmd = ['ffmpeg', '-y', '-i', str(silent_base)]
             
-            # Create batch command
-            batch_cmd = [
-                'ffmpeg', '-y',
-                '-i', str(silent_base)
-            ]
-            
-            # Add all input files and create filter
             filter_parts = []
             for i, mix in enumerate(batch):
                 batch_cmd.extend(['-i', str(mix['file'])])
-                vol = "-6dB" if mix['lyrics_mode'] else "-10dB"
-                filter_parts.append(f"[{i+1}:a]adelay={int(mix['start']*1000)}|{int(mix['start']*1000)},volume={vol}[s{i}];")
+                # Place each voiceover at its timestamp at full volume
+                filter_parts.append(f"[{i+1}:a]adelay={int(mix['start']*1000)}|{int(mix['start']*1000)},volume=0dB[v{i}];")
             
-            # Add mix for all streams
-            stream_refs = ''.join([f'[s{i}]' for i in range(len(batch))])
+            # Mix all voiceovers onto silent base
+            stream_refs = ''.join([f'[v{i}]' for i in range(len(batch))])
             filter_parts.append(f"[0:a]{stream_refs}amix=inputs={len(batch)+1}:normalize=0[out]")
             
             batch_cmd.extend([
@@ -166,53 +168,82 @@ class AudioMixer:
             
             try:
                 subprocess.run(batch_cmd, check=True)
-                temp_audio_segments.append(batch_output)
+                temp_segments.append(batch_output)
             except subprocess.CalledProcessError as e:
                 print(f"Batch processing failed: {e}")
                 continue
         
-        if not temp_audio_segments:
-            print("Warning: No audio segments were successfully processed. Using original audio.")
-            subprocess.run([
+        # Merge all temp segments into one track if needed
+        if len(temp_segments) == 1:
+            # Just use the single segment
+            voiceover_track = temp_segments[0]
+        elif len(temp_segments) > 1:
+            # Merge all segments
+            merge_cmd = ['ffmpeg', '-y']
+            for segment in temp_segments:
+                merge_cmd.extend(['-i', str(segment)])
+                
+            merge_cmd.extend([
+                '-filter_complex', f'amix=inputs={len(temp_segments)}:normalize=0[out]',
+                '-map', '[out]',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                str(voiceover_track)
+            ])
+            
+            try:
+                subprocess.run(merge_cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Merging segments failed: {e}")
+                # Use the first segment as fallback
+                if temp_segments:
+                    voiceover_track = temp_segments[0]
+        
+        # Now create the final audio by mixing original audio with 80% volume during voiceover
+        if os.path.exists(str(voiceover_track)):
+            print("Creating final audio by mixing original with volume-adjusted voiceovers...")
+            
+            # Create volume dip track for original audio - only reduce volume during voiceovers
+            final_cmd = [
                 'ffmpeg', '-y',
-                '-i', str(self.orig_audio),
+                '-i', str(self.orig_audio),      # Original audio
+                '-i', str(voiceover_track),      # Voiceover track
+                '-filter_complex',
+                # Use the voiceover track to create a volume control track
+                '[1:a]volume=0,aeval=1*gt(val(0),0.001)[voiceover_map];' +
+                # Use that map to adjust original audio volume - 0.8 when voiceover is present, 1.0 otherwise
+                '[0:a][voiceover_map]volume=volume=0.8:eval=frame:enable=between(t,0,{duration})[lowered_orig];'.format(duration=max_duration) +
+                # Mix the lowered original with the voiceovers
+                '[lowered_orig][1:a]amix=inputs=2:normalize=0[out]',
+                '-map', '[out]',
                 '-c:a', 'ac3',
                 '-b:a', '192k',
                 str(output_path)
-            ], check=True)
-            return output_path
-        
-        # Mix all batches with original audio
-        print("Mixing batches with original audio...")
-        mix_cmd = ['ffmpeg', '-y']
-        
-        # Add all inputs
-        mix_cmd.extend(['-i', str(self.orig_audio)])  # Original audio first
-        for segment in temp_audio_segments:
-            mix_cmd.extend(['-i', str(segment)])
+            ]
             
-        # Create mix filter
-        mix_cmd.extend([
-            '-filter_complex', f'amix=inputs={len(temp_audio_segments)+1}:normalize=0[out]',
+            try:
+                subprocess.run(final_cmd, check=True)
+                print(f"Final audio processing completed in {time.time() - start_time:.2f} seconds")
+                return output_path
+            except subprocess.CalledProcessError as e:
+                print(f"Final processing failed: {e}")
+                # Fall back to simpler method
+        
+        # Fallback - simple mix if the advanced method failed
+        print("Using simple mix as fallback...")
+        fallback_cmd = [
+            'ffmpeg', '-y',
+            '-i', str(self.orig_audio),
+            '-i', str(voiceover_track) if os.path.exists(str(voiceover_track)) else str(silent_base),
+            '-filter_complex', 'amix=inputs=2:normalize=0[out]',
             '-map', '[out]',
             '-c:a', 'ac3',
             '-b:a', '192k',
             str(output_path)
-        ])
+        ]
         
-        try:
-            subprocess.run(mix_cmd, check=True)
-        except subprocess.CalledProcessError:
-            print("Final mixing failed, using original audio as fallback")
-            subprocess.run([
-                'ffmpeg', '-y',
-                '-i', str(self.orig_audio),
-                '-c:a', 'ac3',
-                '-b:a', '192k',
-                str(output_path)
-            ], check=True)
-        
-        print(f"Audio processing completed in {time.time() - start_time:.2f} seconds")
+        subprocess.run(fallback_cmd, check=True)
+        print(f"Fallback audio processing completed in {time.time() - start_time:.2f} seconds")
         return output_path
 
     def cleanup(self):
