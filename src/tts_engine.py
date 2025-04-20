@@ -7,8 +7,9 @@ import os
 import uuid
 
 class TTSEngine:
-    def __init__(self):
+    def __init__(self, language: str = 'et'):
         self.temp_dir = Path(tempfile.mkdtemp())
+        self.language = language
         
     def generate_speech(self, text: str, speed: float = 1.0) -> Path:
         """Generate speech with a unique filename to avoid conflicts in parallel processing"""
@@ -22,7 +23,7 @@ class TTSEngine:
         
         try:
             # Generate MP3
-            tts = gTTS(text=text, lang='et', slow=False)
+            tts = gTTS(text=text, lang=self.language, slow=False)
             tts.save(str(mp3_path))
             print(f"MP3 generation took {time.time() - start_time:.2f} seconds")
             
