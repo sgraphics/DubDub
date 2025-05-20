@@ -1,0 +1,4 @@
+pysrt==1.1.2
+gtts==2.3.2
+chardet==5.1.0
+tqdm==4.66.1 

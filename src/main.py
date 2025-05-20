@@ -65,7 +65,33 @@ class AIDubber:
         try:
             # Validate paths and create full paths
             video_path = os.path.abspath(video_path)
-            subtitle_path = os.path.abspath(subtitle_path)
+            # Check if subtitle_path is a file path or a language code
+            is_language_code = not ('/' in subtitle_path or '\\' in subtitle_path or '.' in subtitle_path)
+            
+            if is_language_code:
+                print(f"Subtitle path '{subtitle_path}' appears to be a language code. Attempting to extract subtitles from video.")
+                language_code = subtitle_path
+                video_path_obj = Path(video_path)
+                
+                # Load the video file
+                video = self.media_processor.load_video(video_path)
+                
+                # Extract subtitles from the video file
+                extracted_subtitle_path, available_languages = self.media_processor.extract_subtitles(video, language_code)
+                
+                if extracted_subtitle_path is None:
+                    if available_languages:
+                        available_langs_str = ", ".join(available_languages)
+                        raise RuntimeError(f"Could not extract subtitles with language code '{language_code}' from the video file. Available subtitle languages: {available_langs_str}")
+                    else:
+                        raise RuntimeError(f"Could not extract subtitles with language code '{language_code}' from the video file. No subtitle tracks found.")
+                
+                subtitle_path = str(extracted_subtitle_path)
+            else:
+                subtitle_path = os.path.abspath(subtitle_path)
+                # Load the video file
+                video = self.media_processor.load_video(video_path)
+            
             output_path = os.path.abspath(output_path)
             
             print(f"Processing video: {video_path}")
@@ -77,9 +103,6 @@ class AIDubber:
                 if len(str(path)) > 240:
                     print(f"Warning: {name} path is very long ({len(str(path))} chars)")
                     print(f"  {path}")
-            
-            # Load the video file
-            video = self.media_processor.load_video(video_path)
             
             # Parse subtitles
             subtitles = self.subtitle_processor.parse_srt(subtitle_path)
@@ -168,7 +191,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='AI Video Dubbing Tool')
     parser.add_argument('video_path', help='Path to the input video file')
-    parser.add_argument('subtitle_path', help='Path to the subtitle file (.srt format)')
+    parser.add_argument('subtitle_path', help='Path to the subtitle file (.srt format) or language code to extract from the video')
     parser.add_argument('output_path', help='Path where the dubbed video will be saved')
     parser.add_argument('--language', '-l', default='et', help='Language code for TTS (default: et)')
     

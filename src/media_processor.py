@@ -5,12 +5,13 @@ import shutil
 import os
 import hashlib
 import time
-from typing import List
+from typing import List, Optional
 
 class MediaProcessor:
     def __init__(self):
         # Default MKVToolNix installation path
         self.mkvmerge = r"C:\Program Files\MKVToolNix\mkvmerge.exe"
+        self.mkvextract = r"C:\Program Files\MKVToolNix\mkvextract.exe"
         self._verify_mkvtoolnix()
         
         # Create temp directory with a short path to avoid Windows path length limitations
@@ -25,6 +26,78 @@ class MediaProcessor:
             print(f"MKVMerge version: {result.stdout.splitlines()[0]}")
         except FileNotFoundError:
             raise RuntimeError(f"MKVToolNix not found at {self.mkvmerge}. Please install MKVToolNix first.")
+
+    def extract_subtitles(self, video_path: Path, language_code: str) -> tuple[Optional[Path], list[str]]:
+        """Extract subtitles of a specified language from an MKV file
+        
+        Returns:
+            tuple: (subtitle_path, available_languages)
+                - subtitle_path: Path to extracted subtitle file or None if extraction failed
+                - available_languages: List of available subtitle language codes
+        """
+        print(f"Extracting {language_code} subtitles from {video_path}")
+        
+        # First, get info about tracks in the MKV file
+        cmd = [self.mkvmerge, '-J', str(video_path)]
+        available_subtitles = []
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            import json
+            info = json.loads(result.stdout)
+            
+            # Find subtitle track with matching language
+            subtitle_track_id = None
+            
+            for track in info.get('tracks', []):
+                if track.get('type') == 'subtitles':
+                    track_lang = track.get('properties', {}).get('language')
+                    track_name = track.get('properties', {}).get('track_name', '')
+                    track_id = track.get('id')
+                    
+                    # Store information about this subtitle track
+                    subtitle_info = f"{track_lang}"
+                    if track_name:
+                        subtitle_info += f" ({track_name})"
+                    available_subtitles.append(subtitle_info)
+                    
+                    # Check if this is the track we're looking for
+                    if track_lang == language_code:
+                        subtitle_track_id = track_id
+                        print(f"Found {language_code} subtitle track with ID {subtitle_track_id}")
+                        break
+            
+            if subtitle_track_id is None:
+                if available_subtitles:
+                    print(f"No subtitle track with language '{language_code}' found.")
+                    print(f"Available subtitle languages: {', '.join(available_subtitles)}")
+                    return None, available_subtitles
+                else:
+                    print(f"No subtitle tracks found in the video file.")
+                    return None, []
+            
+            # Extract the subtitle track to a temporary SRT file
+            temp_srt = self.temp_dir / f"subtitles_{language_code}.srt"
+            extract_cmd = [
+                self.mkvextract, 'tracks', str(video_path),
+                f"{subtitle_track_id}:{str(temp_srt)}"
+            ]
+            
+            subprocess.run(extract_cmd, check=True)
+            
+            if temp_srt.exists():
+                print(f"Successfully extracted subtitles to {temp_srt}")
+                return temp_srt, available_subtitles
+            else:
+                print(f"Failed to extract subtitles to {temp_srt}")
+                return None, available_subtitles
+                
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing mkvmerge to get track info: {e}")
+            return None, []
+        except Exception as e:
+            print(f"Error extracting subtitles: {e}")
+            return None, []
 
     def load_video(self, video_path: str) -> Path:
         # Convert to Path object
